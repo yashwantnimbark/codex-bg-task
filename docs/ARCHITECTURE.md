@@ -42,6 +42,9 @@ session stops the injector.
 ## Failure Modes
 
 - If the target Codex tmux session is gone, delivery stops.
+- If the target Codex tmux session disappears while the injector is idle, a
+  small liveness monitor exits the injector service within a few seconds. This
+  prevents users from accidentally attaching to a silent injector tmux session.
 - If the target pane is stale, the injector resolves the active pane again.
 - If a duplicate injector starts, a lock file prevents two services from
   delivering the same feed line to one session.

@@ -21,6 +21,7 @@ STATE="$MON_DIR/feed-injector-${SLUG}.state"
 SEQ_FILE="$MON_DIR/feed-injector-${SLUG}.seq"
 FIFO="$MON_DIR/feed-injector-${SLUG}.fifo"
 TAIL_PID=""
+MONITOR_PID=""
 
 mkdir -p "$MON_DIR"
 touch "$FEED"
@@ -78,10 +79,28 @@ cleanup() {
     sleep 0.1
     kill -9 "$TAIL_PID" 2>/dev/null || true
   fi
+  if [ -n "${MONITOR_PID:-}" ]; then
+    kill "$MONITOR_PID" 2>/dev/null || true
+    sleep 0.1
+    kill -9 "$MONITOR_PID" 2>/dev/null || true
+  fi
   rm -f "$PID_FILE" "$FIFO"
   rm -rf "$LOCK_DIR"
   log_line "STOP session=$SESSION status=$status"
   exit "$status"
+}
+
+monitor_target_session() {
+  local main_pid="$1"
+  while :; do
+    sleep 5
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      log_line "TARGET_SESSION_GONE session=$SESSION"
+      write_state "TARGET_SESSION_GONE session=$SESSION"
+      kill "$main_pid" 2>/dev/null || true
+      exit 0
+    fi
+  done
 }
 
 target_alive() {
@@ -273,8 +292,10 @@ rm -f "$FIFO"
 mkfifo "$FIFO"
 tail -F -n 0 "$FEED" > "$FIFO" 2>/dev/null &
 TAIL_PID=$!
+monitor_target_session "$$" &
+MONITOR_PID=$!
 
-log_line "START session=$SESSION feed=$FEED pid=$$ tail_pid=$TAIL_PID"
+log_line "START session=$SESSION feed=$FEED pid=$$ tail_pid=$TAIL_PID monitor_pid=$MONITOR_PID"
 write_state "STARTED session=$SESSION pid=$$"
 
 while IFS= read -r line; do
