@@ -5,6 +5,7 @@
 # Examples:
 #   codex-tmux
 #   codex-tmux work
+#   codex-tmux --yolo work
 #   codex-tmux -- --model gpt-5.5
 #   codex-tmux -- --dangerously-bypass-approvals-and-sandbox
 #   codex-tmux work -- --model gpt-5.5
@@ -13,20 +14,35 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SESSION="codex"
-if [ $# -gt 0 ] && [ "${1:0:2}" != "--" ] && [ "$1" != "--" ]; then
+EXTRA_CODEX_ARG=""
+
+if [ "${1:-}" = "--yol" ]; then
+  echo "Codex flag typo: did you mean --yolo?"
+  echo "Try: codex-tmux --yolo [session-name]"
+  exit 2
+fi
+
+if [ "${1:-}" = "--yolo" ]; then
+  EXTRA_CODEX_ARG="--dangerously-bypass-approvals-and-sandbox"
+  shift
+  if [ $# -gt 0 ] && [ "${1:0:2}" != "--" ] && [ "$1" != "--" ]; then
+    SESSION="$1"
+    shift
+  fi
+elif [ $# -gt 0 ] && [ "${1:0:2}" != "--" ] && [ "$1" != "--" ]; then
   SESSION="$1"
   shift
 fi
 [ "${1:-}" = "--" ] && shift
 
-if [ "${1:-}" = "--yol" ] || [ "${1:-}" = "--yolo" ]; then
-  echo "Codex no longer documents --yolo in current CLI help."
-  echo "Try: codex-tmux -- --dangerously-bypass-approvals-and-sandbox"
-  exit 2
-fi
-
 CODEX_COMMAND="codex"
+if [ -n "$EXTRA_CODEX_ARG" ]; then
+  CODEX_COMMAND="$CODEX_COMMAND $EXTRA_CODEX_ARG"
+fi
 for arg in "$@"; do
+  if [ "$arg" = "--yolo" ]; then
+    arg="--dangerously-bypass-approvals-and-sandbox"
+  fi
   printf -v quoted_arg "%q" "$arg"
   CODEX_COMMAND="$CODEX_COMMAND $quoted_arg"
 done

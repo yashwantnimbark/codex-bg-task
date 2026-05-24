@@ -62,6 +62,15 @@ Start Codex inside tmux:
 codex-tmux
 ```
 
+Start a named session with Codex's sandbox/approval bypass flag:
+
+```sh
+codex-tmux --yolo work
+```
+
+`--yolo` is a compatibility shortcut in this wrapper. It is passed to current
+Codex as `--dangerously-bypass-approvals-and-sandbox`.
+
 In another terminal, send a test event:
 
 ```sh
@@ -111,6 +120,10 @@ codex-bg feed --session work "action=note message=ready"
 ```
 
 Unscoped feed events are delivered only to the default `codex` session.
+
+If a tmux session already exists, `codex-tmux` attaches to it and does not
+restart Codex with new flags. To change startup flags, exit Codex in that tmux
+session or kill the session first, then start it again.
 
 ## How It Works
 
