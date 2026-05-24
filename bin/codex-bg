@@ -1,0 +1,634 @@
+#!/bin/bash
+# codex-bg - local background jobs that wake Codex through ~/.codex/feed.md.
+# Usage:
+#   codex-bg feed [--session codex] <message>
+#   codex-bg run [--action name] [--session codex] -- <command...>
+#   codex-bg sleep <10s|5m|1h> [--action name] [--message text] [--session codex]
+#   codex-bg watch-pr [--session codex] <pr-number> [interval-secs=60] [timeout-mins=60]
+#   codex-bg status [job-id]
+#   codex-bg stop <job-id>
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MON_DIR="$HOME/.codex/monitors"
+FEED="$HOME/.codex/feed.md"
+mkdir -p "$MON_DIR"
+touch "$FEED"
+
+now() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+usage() {
+  cat <<'EOF'
+codex-bg - local background jobs that wake Codex through ~/.codex/feed.md.
+Usage:
+  codex-bg feed [--session codex] <message>
+  codex-bg run [--action name] [--session codex] -- <command...>
+  codex-bg sleep <10s|5m|1h> [--action name] [--message text] [--session codex]
+  codex-bg watch-pr [--session codex] <pr-number> [interval-secs=60] [timeout-mins=60]
+  codex-bg status [job-id]
+  codex-bg stop <job-id>
+EOF
+}
+
+slug() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+validate_session() {
+  local session="$1"
+  if ! printf '%s\n' "$session" | grep -E '^[A-Za-z0-9_.-]+$' >/dev/null 2>&1; then
+    echo "bad session name: $session" >&2
+    echo "Use only letters, numbers, dot, underscore, and hyphen." >&2
+    exit 1
+  fi
+}
+
+validate_integer() {
+  local label="$1"
+  local value="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "bad $label: $value" >&2
+      exit 1
+      ;;
+  esac
+}
+
+injector_ready() {
+  local session="$1"
+  local feed_slug service pid_file target_file target target_session pid
+
+  validate_session "$session"
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    echo "No tmux Codex session named '$session'. Start it with: codex-tmux $session" >&2
+    exit 1
+  fi
+
+  feed_slug="$(slug "$session")"
+  service="codex-feed-injector-${feed_slug}"
+  pid_file="$MON_DIR/feed-injector-${feed_slug}.pid"
+  target_file="$MON_DIR/feed-injector-${feed_slug}.target"
+
+  if tmux has-session -t "$service" 2>/dev/null && [ -s "$pid_file" ] && [ -s "$target_file" ]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    target="$(cat "$target_file" 2>/dev/null || true)"
+    target_session="$(tmux display-message -p -t "$target" '#{session_name}' 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$target_session" = "$session" ]; then
+      return 0
+    fi
+  fi
+
+  "$SCRIPT_DIR/codex-feed-restart" "$session" >/dev/null
+}
+
+quote_var() {
+  printf -v "$1" "%q" "$2"
+}
+
+new_job_id() {
+  printf 'bg-%s-%s\n' "$(date '+%Y%m%dT%H%M%S')" "$$"
+}
+
+duration_to_seconds() {
+  local value="$1"
+  local number=""
+  case "$value" in
+    *s)
+      number="${value%s}"
+      ;;
+    *m)
+      number="${value%m}"
+      case "$number" in ''|*[!0-9]*) return 1 ;; esac
+      printf '%s\n' "$((number * 60))"
+      return 0
+      ;;
+    *h)
+      number="${value%h}"
+      case "$number" in ''|*[!0-9]*) return 1 ;; esac
+      printf '%s\n' "$((number * 3600))"
+      return 0
+      ;;
+    *[!0-9]*)
+      return 1
+      ;;
+    *)
+      number="$value"
+      ;;
+  esac
+  case "$number" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$number"
+}
+
+job_paths() {
+  JOB_ID="$1"
+  JOB_SLUG="$(slug "$JOB_ID")"
+  JOB_SESSION="codex-bg-${JOB_SLUG}"
+  JOB_LOG="$MON_DIR/${JOB_SLUG}.log"
+  JOB_RESULT="$MON_DIR/${JOB_SLUG}.result"
+  JOB_PID="$MON_DIR/${JOB_SLUG}.pid"
+  JOB_META="$MON_DIR/${JOB_SLUG}.meta"
+  JOB_WORKER="$MON_DIR/${JOB_SLUG}.worker.sh"
+}
+
+write_meta() {
+  : > "$JOB_META"
+  printf 'job_id=%s\n' "$JOB_ID" >> "$JOB_META"
+  printf 'kind=%s\n' "$1" >> "$JOB_META"
+  printf 'action=%s\n' "$2" >> "$JOB_META"
+  printf 'tmux_session=%s\n' "$JOB_SESSION" >> "$JOB_META"
+  printf 'created_at=%s\n' "$(now)" >> "$JOB_META"
+  printf 'workdir=%s\n' "$PWD" >> "$JOB_META"
+  printf 'log=%s\n' "$JOB_LOG" >> "$JOB_META"
+  printf 'result=%s\n' "$JOB_RESULT" >> "$JOB_META"
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    printf '%s\n' "$1" >> "$JOB_META"
+    shift
+  done
+}
+
+append_feed() {
+  local session="$1"
+  shift
+  local message="$*"
+  local body="$message"
+  case "$message" in
+    '[BG]'*) body="$(printf '%s\n' "$message" | sed 's/^\[BG\][[:space:]]*//')" ;;
+  esac
+  printf '[BG] session=%s %s\n' "$session" "$body" >> "$FEED"
+}
+
+start_worker() {
+  chmod +x "$JOB_WORKER"
+  tmux new-session -d -s "$JOB_SESSION" "$JOB_WORKER"
+  sleep 0.3
+  if ! tmux has-session -t "$JOB_SESSION" 2>/dev/null; then
+    echo "Failed to start background job '$JOB_ID'" >&2
+    exit 1
+  fi
+  echo "Started $JOB_ID ($JOB_SESSION)"
+}
+
+cmd_feed() {
+  local session="codex"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --session)
+        session="${2:?session required}"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  [ "$#" -gt 0 ] || { echo "message required" >&2; exit 1; }
+  injector_ready "$session"
+  append_feed "$session" "$*"
+  echo "Injected feed event for session '$session': $*"
+}
+
+cmd_run() {
+  local action="command-finished"
+  local session="codex"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --action)
+        action="${2:?action required}"
+        shift 2
+        ;;
+      --session)
+        session="${2:?session required}"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  [ "$#" -gt 0 ] || { echo "command required" >&2; exit 1; }
+  injector_ready "$session"
+
+  local command_text=""
+  if [ "$#" -eq 1 ]; then
+    command_text="$1"
+  else
+    local part=""
+    while [ "$#" -gt 0 ]; do
+      printf -v part "%q" "$1"
+      if [ -z "$command_text" ]; then
+        command_text="$part"
+      else
+        command_text="$command_text $part"
+      fi
+      shift
+    done
+  fi
+
+  JOB_ID="$(new_job_id)"
+  job_paths "$JOB_ID"
+  write_meta "run" "$action" "command=$command_text" "session=$session"
+
+  local q_job q_action q_cmd q_workdir q_log q_result q_pid q_feed q_session
+  quote_var q_job "$JOB_ID"
+  quote_var q_action "$action"
+  quote_var q_cmd "$command_text"
+  quote_var q_workdir "$PWD"
+  quote_var q_log "$JOB_LOG"
+  quote_var q_result "$JOB_RESULT"
+  quote_var q_pid "$JOB_PID"
+  quote_var q_feed "$FEED"
+  quote_var q_session "$session"
+
+  cat > "$JOB_WORKER" <<EOF
+#!/bin/bash
+set -u
+JOB_ID=$q_job
+ACTION=$q_action
+CMD=$q_cmd
+WORKDIR=$q_workdir
+LOG=$q_log
+RESULT=$q_result
+PID_FILE=$q_pid
+FEED=$q_feed
+SESSION_NAME=$q_session
+now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+cleanup() {
+  status=\${1:-143}
+  trap - INT TERM HUP EXIT
+  if [ -n "\${CMD_PID:-}" ] && kill -0 "\$CMD_PID" 2>/dev/null; then
+    kill "\$CMD_PID" 2>/dev/null || true
+    sleep 0.2
+    kill -9 "\$CMD_PID" 2>/dev/null || true
+  fi
+  rm -f "\$PID_FILE"
+  exit "\$status"
+}
+trap 'cleanup 143' INT TERM HUP
+echo \$\$ > "\$PID_FILE"
+echo "\$(now) START job=\$JOB_ID action=\$ACTION command=\$CMD" >> "\$LOG"
+cd "\$WORKDIR" || {
+  STATUS=127
+  echo "\$(now) WORKDIR_FAILED \$WORKDIR" >> "\$LOG"
+  echo "status=\$STATUS" > "\$RESULT"
+  printf '[BG] session=%s action=%s job=%s status=failed exit=%s log=%s\n' "\$SESSION_NAME" "\$ACTION" "\$JOB_ID" "\$STATUS" "\$LOG" >> "\$FEED"
+  rm -f "\$PID_FILE"
+  exit "\$STATUS"
+}
+bash -lc "\$CMD" >> "\$LOG" 2>&1 &
+CMD_PID=\$!
+wait "\$CMD_PID"
+STATUS=\$?
+echo "status=\$STATUS" > "\$RESULT"
+echo "finished_at=\$(now)" >> "\$RESULT"
+echo "log=\$LOG" >> "\$RESULT"
+if [ "\$STATUS" -eq 0 ]; then
+  STATE="passed"
+else
+  STATE="failed"
+fi
+echo "\$(now) DONE job=\$JOB_ID status=\$STATE exit=\$STATUS" >> "\$LOG"
+printf '[BG] session=%s action=%s job=%s status=%s exit=%s log=%s\n' "\$SESSION_NAME" "\$ACTION" "\$JOB_ID" "\$STATE" "\$STATUS" "\$LOG" >> "\$FEED"
+rm -f "\$PID_FILE"
+exit "\$STATUS"
+EOF
+
+  start_worker
+  echo "Log: $JOB_LOG"
+}
+
+cmd_sleep() {
+  local action="wake"
+  local message="timer elapsed"
+  local session="codex"
+  local duration=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --action)
+        action="${2:?action required}"
+        shift 2
+        ;;
+      --message)
+        message="${2:?message required}"
+        shift 2
+        ;;
+      --session)
+        session="${2:?session required}"
+        shift 2
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        if [ -z "$duration" ]; then
+          duration="$1"
+          shift
+        else
+          message="$*"
+          break
+        fi
+        ;;
+    esac
+  done
+  [ -n "$duration" ] || { echo "duration required" >&2; exit 1; }
+  local seconds=""
+  seconds="$(duration_to_seconds "$duration")" || { echo "bad duration: $duration" >&2; exit 1; }
+  injector_ready "$session"
+
+  JOB_ID="$(new_job_id)"
+  job_paths "$JOB_ID"
+  write_meta "sleep" "$action" "duration=$duration" "seconds=$seconds" "message=$message" "session=$session"
+
+  local q_job q_action q_duration q_seconds q_message q_log q_result q_pid q_feed q_session
+  quote_var q_job "$JOB_ID"
+  quote_var q_action "$action"
+  quote_var q_duration "$duration"
+  quote_var q_seconds "$seconds"
+  quote_var q_message "$message"
+  quote_var q_log "$JOB_LOG"
+  quote_var q_result "$JOB_RESULT"
+  quote_var q_pid "$JOB_PID"
+  quote_var q_feed "$FEED"
+  quote_var q_session "$session"
+
+  cat > "$JOB_WORKER" <<EOF
+#!/bin/bash
+set -u
+JOB_ID=$q_job
+ACTION=$q_action
+DURATION=$q_duration
+SECONDS_TO_SLEEP=$q_seconds
+MESSAGE=$q_message
+LOG=$q_log
+RESULT=$q_result
+PID_FILE=$q_pid
+FEED=$q_feed
+SESSION_NAME=$q_session
+now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+cleanup() {
+  trap - INT TERM HUP EXIT
+  if [ -n "\${SLEEP_PID:-}" ] && kill -0 "\$SLEEP_PID" 2>/dev/null; then
+    kill "\$SLEEP_PID" 2>/dev/null || true
+  fi
+  rm -f "\$PID_FILE"
+  exit 143
+}
+trap cleanup INT TERM HUP
+echo \$\$ > "\$PID_FILE"
+echo "\$(now) START timer job=\$JOB_ID duration=\$DURATION seconds=\$SECONDS_TO_SLEEP" >> "\$LOG"
+sleep "\$SECONDS_TO_SLEEP" &
+SLEEP_PID=\$!
+wait "\$SLEEP_PID"
+echo "status=elapsed" > "\$RESULT"
+echo "finished_at=\$(now)" >> "\$RESULT"
+echo "\$(now) DONE timer job=\$JOB_ID" >> "\$LOG"
+printf '[BG] session=%s action=%s job=%s status=elapsed duration=%s message=%s\n' "\$SESSION_NAME" "\$ACTION" "\$JOB_ID" "\$DURATION" "\$MESSAGE" >> "\$FEED"
+rm -f "\$PID_FILE"
+EOF
+
+  start_worker
+}
+
+cmd_watch_pr() {
+  local session="codex"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --session)
+        session="${2:?session required}"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  [ "$#" -gt 0 ] || { echo "PR number required" >&2; exit 1; }
+  local pr="$1"
+  local interval="${2:-60}"
+  local timeout_min="${3:-60}"
+  validate_integer "interval" "$interval"
+  validate_integer "timeout minutes" "$timeout_min"
+  injector_ready "$session"
+  local action="pr-review-update"
+  JOB_ID="$(new_job_id)"
+  job_paths "$JOB_ID"
+  write_meta "watch-pr" "$action" "pr=$pr" "interval=$interval" "timeout_min=$timeout_min" "session=$session"
+
+  local q_job q_action q_pr q_interval q_timeout q_workdir q_log q_result q_pid q_feed q_session
+  quote_var q_job "$JOB_ID"
+  quote_var q_action "$action"
+  quote_var q_pr "$pr"
+  quote_var q_interval "$interval"
+  quote_var q_timeout "$timeout_min"
+  quote_var q_workdir "$PWD"
+  quote_var q_log "$JOB_LOG"
+  quote_var q_result "$JOB_RESULT"
+  quote_var q_pid "$JOB_PID"
+  quote_var q_feed "$FEED"
+  quote_var q_session "$session"
+
+  cat > "$JOB_WORKER" <<'EOF_HEADER'
+#!/bin/bash
+set -u
+EOF_HEADER
+  cat >> "$JOB_WORKER" <<EOF
+JOB_ID=$q_job
+ACTION=$q_action
+PR=$q_pr
+INTERVAL=$q_interval
+TIMEOUT_MIN=$q_timeout
+WORKDIR=$q_workdir
+LOG=$q_log
+RESULT=$q_result
+PID_FILE=$q_pid
+FEED=$q_feed
+SESSION_NAME=$q_session
+EOF
+  cat >> "$JOB_WORKER" <<'EOF_BODY'
+now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+cleanup() {
+  trap - INT TERM HUP EXIT
+  rm -f "$PID_FILE"
+  exit 143
+}
+trap cleanup INT TERM HUP
+field_or_zero() {
+  jq -r "$1 // 0" 2>/dev/null
+}
+summarize_checks() {
+  jq -r '[.statusCheckRollup[]? | select(.status=="COMPLETED" and .conclusion!="SUCCESS" and .conclusion!="NEUTRAL" and .conclusion!="SKIPPED") | .conclusion] | length' 2>/dev/null
+}
+echo $$ > "$PID_FILE"
+cd "$WORKDIR" || exit 127
+END_TS=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
+echo "$(now) START watch-pr job=$JOB_ID pr=$PR interval=${INTERVAL}s timeout=${TIMEOUT_MIN}m" >> "$LOG"
+
+BASE_REVIEWS=0
+BASE_COMMENTS=0
+BASE_DECISION=""
+if STATE=$(gh pr view "$PR" --json reviewDecision,reviews,comments,statusCheckRollup,url,title 2>>"$LOG"); then
+  BASE_REVIEWS=$(printf '%s\n' "$STATE" | jq -r '.reviews | length')
+  BASE_COMMENTS=$(printf '%s\n' "$STATE" | jq -r '.comments | length')
+  BASE_DECISION=$(printf '%s\n' "$STATE" | jq -r '.reviewDecision // ""')
+fi
+
+while [ "$(date +%s)" -lt "$END_TS" ]; do
+  if ! STATE=$(gh pr view "$PR" --json reviewDecision,reviews,comments,statusCheckRollup,url,title 2>>"$LOG"); then
+    echo "$(now) gh ERROR" >> "$LOG"
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  DECISION=$(printf '%s\n' "$STATE" | jq -r '.reviewDecision // ""')
+  REVIEWS=$(printf '%s\n' "$STATE" | jq -r '.reviews | length')
+  COMMENTS=$(printf '%s\n' "$STATE" | jq -r '.comments | length')
+  URL=$(printf '%s\n' "$STATE" | jq -r '.url // ""')
+  FAILED=$(printf '%s\n' "$STATE" | summarize_checks)
+
+  echo "$(now) decision=${DECISION:-NONE} reviews=$REVIEWS comments=$COMMENTS failed_checks=$FAILED" >> "$LOG"
+
+  if [ "$DECISION" != "$BASE_DECISION" ] || [ "$REVIEWS" -gt "$BASE_REVIEWS" ] || [ "$COMMENTS" -gt "$BASE_COMMENTS" ] || [ "$FAILED" -gt 0 ]; then
+    printf '%s\n' "$STATE" > "$RESULT"
+    printf '[BG] session=%s action=%s job=%s pr=%s status=review_signal decision=%s reviews=%s comments=%s failed_checks=%s url=%s\n' "$SESSION_NAME" "$ACTION" "$JOB_ID" "$PR" "${DECISION:-NONE}" "$REVIEWS" "$COMMENTS" "$FAILED" "$URL" >> "$FEED"
+    echo "$(now) DONE review_signal" >> "$LOG"
+    rm -f "$PID_FILE"
+    exit 0
+  fi
+
+  sleep "$INTERVAL"
+done
+
+echo "TIMEOUT" > "$RESULT"
+printf '[BG] session=%s action=%s job=%s pr=%s status=timeout timeout_min=%s\n' "$SESSION_NAME" "$ACTION" "$JOB_ID" "$PR" "$TIMEOUT_MIN" >> "$FEED"
+echo "$(now) TIMEOUT" >> "$LOG"
+rm -f "$PID_FILE"
+exit 2
+EOF_BODY
+
+  start_worker
+  echo "Watching PR #$pr every ${interval}s for ${timeout_min}m"
+}
+
+meta_value() {
+  local key="$1"
+  local file="$2"
+  awk -F= -v k="$key" '$1 == k { sub($1 "=", ""); print; exit }' "$file" 2>/dev/null
+}
+
+cmd_status() {
+  if [ "$#" -gt 0 ]; then
+    local id="$1"
+    job_paths "$id"
+    [ -f "$JOB_META" ] || { echo "No job meta for $id" >&2; exit 1; }
+    cat "$JOB_META"
+    if tmux has-session -t "$JOB_SESSION" 2>/dev/null; then
+      echo "running=yes"
+    else
+      echo "running=no"
+    fi
+    echo "--- result ---"
+    cat "$JOB_RESULT" 2>/dev/null || echo "no result yet"
+    echo "--- log tail ---"
+    tail -20 "$JOB_LOG" 2>/dev/null || echo "no log yet"
+    exit 0
+  fi
+
+  local found=0
+  for meta in "$MON_DIR"/bg-*.meta; do
+    [ -e "$meta" ] || continue
+    found=1
+    local id kind action tmux_session created
+    id="$(meta_value job_id "$meta")"
+    kind="$(meta_value kind "$meta")"
+    action="$(meta_value action "$meta")"
+    tmux_session="$(meta_value tmux_session "$meta")"
+    created="$(meta_value created_at "$meta")"
+    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+      state="running"
+    else
+      state="stopped"
+    fi
+    printf '%s %-9s %-18s %-8s %s\n' "$id" "$kind" "$action" "$state" "$created"
+  done
+  [ "$found" -eq 1 ] || echo "No codex-bg jobs found"
+}
+
+cmd_stop() {
+  [ "$#" -gt 0 ] || { echo "job id required" >&2; exit 1; }
+  local id="$1"
+  job_paths "$id"
+  [ -f "$JOB_META" ] || { echo "No job meta for $id" >&2; exit 1; }
+
+  if tmux has-session -t "$JOB_SESSION" 2>/dev/null; then
+    tmux kill-session -t "$JOB_SESSION" 2>/dev/null || true
+    echo "Stopped tmux job session $JOB_SESSION"
+  fi
+
+  if [ -s "$JOB_PID" ]; then
+    PID="$(cat "$JOB_PID" 2>/dev/null || true)"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+      kill "$PID" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$PID" 2>/dev/null || true
+      echo "Stopped pid $PID"
+    fi
+  fi
+
+  echo "status=stopped" > "$JOB_RESULT"
+  echo "finished_at=$(now)" >> "$JOB_RESULT"
+  rm -f "$JOB_PID"
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  feed)
+    shift
+    cmd_feed "$@"
+    ;;
+  run)
+    shift
+    cmd_run "$@"
+    ;;
+  sleep)
+    shift
+    cmd_sleep "$@"
+    ;;
+  watch-pr)
+    shift
+    cmd_watch_pr "$@"
+    ;;
+  status|list)
+    shift
+    cmd_status "$@"
+    ;;
+  stop)
+    shift
+    cmd_stop "$@"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

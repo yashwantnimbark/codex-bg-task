@@ -1,0 +1,63 @@
+#!/bin/bash
+# codex-tmux - launch Codex in tmux with a robust feed injector service.
+# Usage: codex-tmux [session-name] [-- codex-args...]
+# Default session name: codex
+# Examples:
+#   codex-tmux
+#   codex-tmux work
+#   codex-tmux -- --model gpt-5.5
+#   codex-tmux -- --dangerously-bypass-approvals-and-sandbox
+#   codex-tmux work -- --model gpt-5.5
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SESSION="codex"
+if [ $# -gt 0 ] && [ "${1:0:2}" != "--" ] && [ "$1" != "--" ]; then
+  SESSION="$1"
+  shift
+fi
+[ "${1:-}" = "--" ] && shift
+
+if [ "${1:-}" = "--yol" ] || [ "${1:-}" = "--yolo" ]; then
+  echo "Codex no longer documents --yolo in current CLI help."
+  echo "Try: codex-tmux -- --dangerously-bypass-approvals-and-sandbox"
+  exit 2
+fi
+
+CODEX_COMMAND="codex"
+for arg in "$@"; do
+  printf -v quoted_arg "%q" "$arg"
+  CODEX_COMMAND="$CODEX_COMMAND $quoted_arg"
+done
+printf -v start_dir "%q" "$PWD"
+TMUX_COMMAND="cd $start_dir; $CODEX_COMMAND; status=\$?; if [ \$status -ne 0 ]; then printf '\\nCodex exited with status %s.\\n' \"\$status\"; printf 'Press Enter to close tmux.\\n'; read _; fi"
+
+ensure_injector() {
+  "$SCRIPT_DIR/codex-feed-restart" "$SESSION"
+}
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "Attaching to existing tmux session '$SESSION'"
+  if [ $# -gt 0 ]; then
+    echo "Note: existing session found, so new Codex args were not used."
+    echo "To start fresh, exit/kill that session or use a different session name."
+  fi
+  ensure_injector
+  tmux attach -t "$SESSION"
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    "$SCRIPT_DIR/codex-feed-stop" "$SESSION" >/dev/null 2>&1 || true
+  fi
+  exit 0
+fi
+
+tmux new-session -d -s "$SESSION" "$TMUX_COMMAND"
+sleep 0.5
+ensure_injector
+echo "Feed file: ~/.codex/feed.md"
+
+tmux attach -t "$SESSION"
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  "$SCRIPT_DIR/codex-feed-stop" "$SESSION" >/dev/null 2>&1 || true
+  echo "Stopped feed-injector service for session '$SESSION'"
+fi

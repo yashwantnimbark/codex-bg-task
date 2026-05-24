@@ -1,0 +1,47 @@
+#!/bin/bash
+# codex-feed-restart - restart the feed injector service for a Codex tmux session.
+# Usage: codex-feed-restart [session-name]
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SESSION="${1:-codex}"
+MON_DIR="$HOME/.codex/monitors"
+mkdir -p "$MON_DIR"
+
+slug_session() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+SLUG="$(slug_session "$SESSION")"
+SERVICE="codex-feed-injector-${SLUG}"
+TARGET_FILE="$MON_DIR/feed-injector-${SLUG}.target"
+PID_FILE="$MON_DIR/feed-injector-${SLUG}.pid"
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "No tmux session named '$SESSION'" >&2
+  exit 1
+fi
+
+TARGET="$(tmux list-panes -t "$SESSION" -F '#{pane_active} #{pane_id}' | awk '$1 == "1" { print $2; exit }')"
+if [ -z "$TARGET" ]; then
+  echo "Could not resolve active pane for '$SESSION'" >&2
+  exit 1
+fi
+printf '%s\n' "$TARGET" > "$TARGET_FILE"
+
+"$SCRIPT_DIR/codex-feed-stop" "$SESSION" --quiet >/dev/null 2>&1 || true
+
+printf -v quoted_session "%q" "$SESSION"
+printf -v quoted_home "%q" "$HOME"
+printf -v quoted_injector "%q" "$SCRIPT_DIR/codex-feed-injector"
+tmux new-session -d -s "$SERVICE" "HOME=$quoted_home $quoted_injector $quoted_session"
+sleep 0.5
+
+if ! tmux has-session -t "$SERVICE" 2>/dev/null; then
+  echo "Failed to start feed injector service '$SERVICE'" >&2
+  exit 1
+fi
+
+PID="$(cat "$PID_FILE" 2>/dev/null || echo unknown)"
+echo "Started feed-injector service '$SERVICE' for session '$SESSION' target '$TARGET' pid $PID"

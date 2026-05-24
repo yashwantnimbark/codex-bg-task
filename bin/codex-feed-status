@@ -1,0 +1,60 @@
+#!/bin/bash
+# codex-feed-status - inspect the feed injector service for a Codex tmux session.
+# Usage: codex-feed-status [session-name]
+
+set -u
+
+SESSION="${1:-codex}"
+MON_DIR="$HOME/.codex/monitors"
+
+slug_session() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+SLUG="$(slug_session "$SESSION")"
+SERVICE="codex-feed-injector-${SLUG}"
+PID_FILE="$MON_DIR/feed-injector-${SLUG}.pid"
+TARGET_FILE="$MON_DIR/feed-injector-${SLUG}.target"
+LOCK_DIR="$MON_DIR/feed-injector-${SLUG}.lock"
+LOG="$MON_DIR/feed-injector-${SLUG}.log"
+STATE="$MON_DIR/feed-injector-${SLUG}.state"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "codex session: yes ($SESSION)"
+else
+  echo "codex session: no ($SESSION)"
+fi
+
+if tmux has-session -t "$SERVICE" 2>/dev/null; then
+  echo "injector service: yes ($SERVICE)"
+else
+  echo "injector service: no ($SERVICE)"
+fi
+
+TARGET="$(cat "$TARGET_FILE" 2>/dev/null || true)"
+if [ -n "$TARGET" ]; then
+  if tmux display-message -p -t "$TARGET" '#{pane_id}' >/dev/null 2>&1; then
+    echo "target pane: $TARGET alive"
+  else
+    echo "target pane: $TARGET stale"
+  fi
+else
+  echo "target pane: missing"
+fi
+
+PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+  echo "pid: $PID alive"
+else
+  echo "pid: ${PID:-missing}"
+fi
+
+if [ -d "$LOCK_DIR" ]; then
+  echo "lock: present owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo unknown)"
+else
+  echo "lock: absent"
+fi
+
+echo "state: $(cat "$STATE" 2>/dev/null || echo missing)"
+echo "--- last log lines ---"
+tail -10 "$LOG" 2>/dev/null || echo "no log"

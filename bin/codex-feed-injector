@@ -1,0 +1,296 @@
+#!/bin/bash
+# codex-feed-injector - deliver ~/.codex/feed.md events into one tmux pane.
+# Usage: codex-feed-injector <codex-session-name>
+
+set -u
+
+SESSION="${1:?session name required}"
+FEED="$HOME/.codex/feed.md"
+MON_DIR="$HOME/.codex/monitors"
+
+slug_session() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+SLUG="$(slug_session "$SESSION")"
+PID_FILE="$MON_DIR/feed-injector-${SLUG}.pid"
+TARGET_FILE="$MON_DIR/feed-injector-${SLUG}.target"
+LOCK_DIR="$MON_DIR/feed-injector-${SLUG}.lock"
+LOG="$MON_DIR/feed-injector-${SLUG}.log"
+STATE="$MON_DIR/feed-injector-${SLUG}.state"
+SEQ_FILE="$MON_DIR/feed-injector-${SLUG}.seq"
+FIFO="$MON_DIR/feed-injector-${SLUG}.fifo"
+TAIL_PID=""
+
+mkdir -p "$MON_DIR"
+touch "$FEED"
+
+now() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+log_line() {
+  printf '%s %s\n' "$(now)" "$*" >> "$LOG"
+}
+
+write_state() {
+  printf '%s %s\n' "$(now)" "$*" > "$STATE"
+}
+
+is_live_pid() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -p "$pid" -o command= 2>/dev/null | grep -F "codex-feed-injector $SESSION" >/dev/null 2>&1
+}
+
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "$LOCK_DIR/pid"
+    return 0
+  fi
+
+  local owner=""
+  owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if is_live_pid "$owner"; then
+    log_line "LOCK_HELD owner=$owner session=$SESSION"
+    write_state "LOCK_HELD owner=$owner session=$SESSION"
+    exit 1
+  fi
+
+  rm -rf "$LOCK_DIR"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "$LOCK_DIR/pid"
+    log_line "STALE_LOCK_CLEARED owner=${owner:-unknown}"
+    return 0
+  fi
+
+  log_line "LOCK_FAILED session=$SESSION"
+  write_state "LOCK_FAILED session=$SESSION"
+  exit 1
+}
+
+cleanup() {
+  local status=$?
+  trap - INT TERM HUP EXIT
+  if [ -n "${TAIL_PID:-}" ]; then
+    kill "$TAIL_PID" 2>/dev/null || true
+    sleep 0.1
+    kill -9 "$TAIL_PID" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE" "$FIFO"
+  rm -rf "$LOCK_DIR"
+  log_line "STOP session=$SESSION status=$status"
+  exit "$status"
+}
+
+target_alive() {
+  local target="$1"
+  local pane_session=""
+  pane_session="$(tmux display-message -p -t "$target" '#{session_name}' 2>/dev/null || true)"
+  [ "$pane_session" = "$SESSION" ]
+}
+
+resolve_target() {
+  local target=""
+
+  if [ -s "$TARGET_FILE" ]; then
+    target="$(sed -n '1p' "$TARGET_FILE")"
+    if target_alive "$target"; then
+      printf '%s\n' "$target"
+      return 0
+    fi
+    log_line "STALE_TARGET target=${target:-empty}"
+  fi
+
+  target="$(tmux list-panes -t "$SESSION" -F '#{pane_active} #{pane_id}' 2>/dev/null | awk '$1 == "1" { print $2; exit }')"
+  if [ -n "$target" ] && target_alive "$target"; then
+    printf '%s\n' "$target" > "$TARGET_FILE"
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  return 1
+}
+
+next_event_id() {
+  local seq=0
+  if [ -s "$SEQ_FILE" ]; then
+    seq="$(cat "$SEQ_FILE" 2>/dev/null || echo 0)"
+  fi
+  case "$seq" in
+    ''|*[!0-9]*) seq=0 ;;
+  esac
+  seq=$((seq + 1))
+  echo "$seq" > "$SEQ_FILE"
+  printf '%s-%03d\n' "$(date '+%Y%m%dT%H%M%S')" "$seq"
+}
+
+pane_is_busy() {
+  local target="$1"
+  local capture=""
+  capture="$(tmux capture-pane -p -J -t "$target" -S -40 2>/dev/null | awk '
+    NF { lines[++n] = $0 }
+    END {
+      start = n - 12
+      if (start < 1) start = 1
+      for (i = start; i <= n; i++) print lines[i]
+    }
+  ' || true)"
+  printf '%s\n' "$capture" | grep -E 'Working \(|Queued follow-up inputs|esc to interrupt|/stop to close|background terminal running' >/dev/null 2>&1
+}
+
+verify_delivery() {
+  local target="$1"
+  local message="$2"
+  local capture=""
+  local checks=0
+
+  while [ "$checks" -lt 10 ]; do
+    capture="$(tmux capture-pane -p -J -t "$target" -S -160 2>/dev/null || true)"
+
+    if printf '%s\n' "$capture" | grep -F "$message" >/dev/null 2>&1; then
+      if printf '%s\n' "$capture" | grep -F 'Queued follow-up inputs' >/dev/null 2>&1; then
+        printf '%s\n' "queued"
+      else
+        printf '%s\n' "visible"
+      fi
+      return 0
+    fi
+
+    sleep 0.25
+    checks=$((checks + 1))
+  done
+
+  printf '%s\n' "unconfirmed"
+  return 1
+}
+
+line_session() {
+  printf '%s\n' "$1" | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^session=/) {
+          sub(/^session=/, "", $i)
+          print $i
+          exit
+        }
+      }
+    }
+  '
+}
+
+send_to_codex() {
+  local target="$1"
+  local message="$2"
+  local event_id="$3"
+  local buffer="codex-bg-${SLUG}-${event_id}"
+
+  if ! printf '%s' "$message" | tmux load-buffer -b "$buffer" - 2>>"$LOG"; then
+    log_line "LOAD_BUFFER_FAILED event_id=$event_id target=$target buffer=$buffer"
+    return 1
+  fi
+
+  if ! tmux paste-buffer -p -d -b "$buffer" -t "$target" 2>>"$LOG"; then
+    log_line "PASTE_BUFFER_FAILED event_id=$event_id target=$target buffer=$buffer"
+    return 1
+  fi
+
+  # Codex TUI submits queued/idle follow-up input with Tab. Enter can create
+  # an unwanted multiline edit, so do not send it here.
+  sleep 0.35
+  if ! tmux send-keys -t "$target" Tab 2>>"$LOG"; then
+    log_line "SEND_TAB_FAILED event_id=$event_id target=$target"
+    return 1
+  fi
+}
+
+deliver_line() {
+  local raw_line="$1"
+  local event_id="$2"
+  local body="$raw_line"
+  local message=""
+
+  case "$body" in
+    '[BG]'*) body="$(printf '%s\n' "$body" | sed 's/^\[BG\][[:space:]]*//')" ;;
+  esac
+  message="[BG] event_id=$event_id $body"
+
+  local attempt=1
+  local target=""
+  while [ "$attempt" -le 3 ]; do
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      log_line "SESSION_GONE event_id=$event_id session=$SESSION"
+      write_state "SESSION_GONE event_id=$event_id session=$SESSION"
+      exit 0
+    fi
+
+    if ! target="$(resolve_target)"; then
+      log_line "TARGET_MISSING event_id=$event_id attempt=$attempt session=$SESSION"
+      write_state "TARGET_MISSING event_id=$event_id attempt=$attempt session=$SESSION"
+      sleep "$attempt"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    local mode="submit"
+    if pane_is_busy "$target"; then
+      mode="queue"
+    fi
+
+    log_line "DELIVER_START event_id=$event_id attempt=$attempt mode=$mode target=$target line=$raw_line"
+    write_state "DELIVERING event_id=$event_id mode=$mode target=$target"
+
+    if ! send_to_codex "$target" "$message" "$event_id"; then
+      log_line "SEND_TO_CODEX_FAILED event_id=$event_id attempt=$attempt target=$target"
+      sleep "$attempt"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    sleep 0.7
+    local verdict=""
+    if verdict="$(verify_delivery "$target" "$message")"; then
+      log_line "DELIVERED event_id=$event_id verdict=$verdict mode=$mode target=$target"
+      write_state "DELIVERED event_id=$event_id verdict=$verdict mode=$mode target=$target"
+    else
+      log_line "DELIVERY_UNCONFIRMED event_id=$event_id verdict=$verdict mode=$mode target=$target"
+      write_state "DELIVERY_UNCONFIRMED event_id=$event_id mode=$mode target=$target"
+    fi
+    return 0
+  done
+
+  log_line "FAILED_DELIVERY event_id=$event_id line=$raw_line"
+  write_state "FAILED_DELIVERY event_id=$event_id"
+  return 1
+}
+
+acquire_lock
+echo $$ > "$PID_FILE"
+trap cleanup INT TERM HUP EXIT
+
+rm -f "$FIFO"
+mkfifo "$FIFO"
+tail -F -n 0 "$FEED" > "$FIFO" 2>/dev/null &
+TAIL_PID=$!
+
+log_line "START session=$SESSION feed=$FEED pid=$$ tail_pid=$TAIL_PID"
+write_state "STARTED session=$SESSION pid=$$"
+
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  case "$line" in \#*) continue ;; esac
+
+  event_session="$(line_session "$line")"
+  if [ -n "$event_session" ] && [ "$event_session" != "$SESSION" ]; then
+    log_line "SKIP_SESSION_MISMATCH session=$event_session target_session=$SESSION line=$line"
+    continue
+  fi
+  if [ -z "$event_session" ] && [ "$SESSION" != "codex" ]; then
+    log_line "SKIP_UNSCOPED target_session=$SESSION line=$line"
+    continue
+  fi
+
+  event_id="$(next_event_id)"
+  deliver_line "$line" "$event_id" || true
+done < "$FIFO"
